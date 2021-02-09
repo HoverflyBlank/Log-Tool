@@ -6,6 +6,27 @@ import subprocess
 import threading
 import time
 import shutil
+import mechanicalsoup
+import re
+import lzma
+
+download_column = [
+    [
+        sg.Text("PI CONNECTION: [~~~~~~~~~~~~~~~]"),
+        sg.Button("Get Logs", key="_GET LOGS BUTTON_", button_color=('white', 'red'))
+    ],
+    [
+        sg.Text("Flight to download:")
+    ],
+    [
+        sg.Listbox(values=[], size=(47, 20), key="_PI FILE LIST_")
+    ],
+    [
+        sg.Text("Flight Name:"),
+        sg.In(size=(23, 1), enable_events=True, key="_FLIGHT NAME_"),
+        sg.Button("DOWNLOAD", key="_DOWNLOAD BUTTON_")
+    ]
+]
 
 convert_column = [
     [
@@ -55,6 +76,8 @@ combine_column = [
 
 layout = [
     [
+        sg.Column(download_column),
+        sg.VSeperator(),
         sg.Column(convert_column),
         sg.VSeperator(),
         sg.Column(combine_column)
@@ -68,6 +91,7 @@ class Aggregator:
         self.window = window
         self.base_path = ""
         self.fnames = []
+        self.flights = []
 
     def main_window_loop(self):
         while True:
@@ -78,6 +102,22 @@ class Aggregator:
             if event == "_FOLDER_":
                 self.base_path = values["_FOLDER_"]
                 self.update_fnames()
+
+            elif event == "_GET LOGS BUTTON_":
+                self.get_logs()
+
+            elif event == "_DOWNLOAD BUTTON_":
+                if not values["_PI FILE LIST_"]:
+                    self.invoke_error("Select Flight to Download")
+                    continue
+
+                if not values["_FLIGHT NAME_"]:
+                    self.invoke_error("Input Flight Name")
+                    continue
+
+                bg_thread = threading.Thread(target=self.download_logs, args=(values["_PI FILE LIST_"],
+                                                                              values["_FLIGHT NAME_"]))
+                self.loading_anim(bg_thread, "Downloading")
 
             elif event == "_CONVERT BUTTON_":
                 if not values["_FILE LIST_"]:
@@ -134,8 +174,8 @@ class Aggregator:
 
         self.fnames = [f for f in file_list if os.path.isfile(os.path.join(self.base_path, f))]
 
-        self.window["_PIX LIST_"].update(self.fnames)
-        self.window["_FILE LIST_"].update(self.fnames)
+        self.window["_PIX LIST_"].update([x for x in self.fnames if not x.endswith(".xz")])
+        self.window["_FILE LIST_"].update([x for x in self.fnames if not x.endswith(".xz")])
 
         self.window["_BGU LIST_"].update([x for x in self.fnames if x.endswith(".bin")])
         self.window["_LOG LIST_"].update([x for x in self.fnames if x.endswith(".bin")])
@@ -157,11 +197,120 @@ class Aggregator:
 
     def combine_files(self, combo_log, pix_log, bgu_log, other_logs, offset):
         if other_logs:
-            subprocess.call("python DFParser.py \"{}\" \"{}\" -a \"{}\" -f {} -d GPS -t {}"
+            subprocess.call("DFParser.exe \"{}\" \"{}\" -a \"{}\" -f {} -d GPS -t {}"
                             .format(combo_log, pix_log, bgu_log, other_logs, offset), shell=True)
         else:
-            subprocess.call("python DFParser.py \"{}\" \"{}\" -a \"{}\" -d GPS -t {}"
+            subprocess.call("DFParser.exe \"{}\" \"{}\" -a \"{}\" -d GPS -t {}"
                             .format(combo_log, pix_log, bgu_log, offset), shell=True)
+
+    def login_to_pi(self):
+        webAddr = "http://10.20.30.200"
+
+        browser = mechanicalsoup.StatefulBrowser()
+        browser.open(webAddr)
+
+        browser.select_form()
+        browser["UserName"] = "admin"
+        browser["Password"] = "admin"
+
+        resp = browser.submit_selected()
+        return browser
+
+    def download_logs(self, file, flight_name):
+        ddir = os.path.expandvars(r'%HOMEPATH%\Desktop\HFLogs')
+        fdir = "{}\\{}".format(ddir, flight_name)
+        logName = ""
+
+        if not os.path.exists(ddir):
+            os.mkdir(ddir)
+
+        if not os.path.exists(fdir):
+            os.mkdir(fdir)
+
+        browser = self.login_to_pi()
+        browser.open('http://10.20.30.200/Logs/ViewLogs?logType=all')
+
+        for flight in self.flights:
+            if flight[0] == file[0]:
+                for i, log in enumerate(flight):
+
+                    match = re.search('(?<=\.)(.*)', log)
+                    if i == 0:
+                        if match:
+                            logName = "{}_FMS.{}".format(flight_name, match.group(0))
+                    elif i == 1:
+                        if match:
+                            logName = "{}_BGU.{}".format(flight_name, match.group(0))
+                    elif i == 2:
+                        logName = log
+                    elif i == 3:
+                        if match:
+                            logName = "{}_HUE.{}".format(flight_name, match.group(0))
+                    elif i == 4:
+                        if match:
+                            logName = "{}_BARO.{}".format(flight_name, match.group(0))
+                    elif i == 5:
+                        if match:
+                            logName = "{}_HUD.{}".format(flight_name, match.group(0))
+
+                    browser.download_link(browser.find_link(url_regex=log), "{}\\{}".format(fdir, logName))
+
+        self.unzip_logs(fdir)
+
+    def unzip_logs(self, fdir):
+        for file in os.listdir(fdir):
+            if file[-3:] != ".xz":
+                continue
+
+            with lzma.open(os.path.join(fdir, file)) as infile, open(os.path.join(fdir, file[:-3]), 'wb') as outfile:
+                file_content = infile.read()
+                outfile.write(file_content)
+
+    def get_logs(self):
+        browser = self.login_to_pi()
+
+        browser.open('http://10.20.30.200/Logs/ViewLogs?logType=all')
+        page = browser.page
+
+        fmsList = []
+        bguDataList = []
+        bguServerList = []
+        hubLogList = []
+        data = [fmsList, bguDataList, bguServerList, hubLogList]
+        tables = page.find_all('table')
+        passLoop = False
+        self.flights = []
+
+        for i in range(len(tables)):
+            rows = tables[i].find_all('tr')
+            for row in rows:
+                cols = row.find_all('td')
+                cols = [ele.text.strip() for ele in cols]
+
+                for item in cols:
+                    if item == "desktop.ini.xz":
+                        passLoop = True
+
+                if not passLoop:
+                    data[i].append([ele for ele in cols if ele])
+
+                passLoop = False
+
+        offset = 0
+
+        for i in range(1, len(data[0])):
+            fmsLog = data[0][i][1]
+            bguDataLog = data[1][i][1]
+            bguServerLog = data[2][i][1]
+            baroLog = data[3][i + offset][1]
+            hubDataLog = data[3][i + offset + 1][1]
+            hubEventLog = data[3][i + offset + 2][1]
+
+            self.flights.append([fmsLog, bguDataLog, bguServerLog, baroLog, hubDataLog, hubEventLog])
+            offset += 2
+
+        self.window["_PI FILE LIST_"].update([f[0] for f in self.flights])
+        browser.close()
 
     # Can't get Mission Planner to open without freezing the Log Tool
     # def open_mp(self):
