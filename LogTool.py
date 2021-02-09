@@ -9,11 +9,13 @@ import shutil
 import mechanicalsoup
 import re
 import lzma
+import winping
 
 download_column = [
     [
-        sg.Text("PI CONNECTION: [~~~~~~~~~~~~~~~]"),
-        sg.Button("Get Logs", key="_GET LOGS BUTTON_", button_color=('white', 'red'))
+        sg.Text("PI CONNECTION:"),
+        sg.Text("[~~~~~~~~~~~~~~~]", key="_PI CONNECTION_"),
+        sg.Button("Get Logs", key="_GET LOGS BUTTON_")
     ],
     [
         sg.Text("Flight to download:")
@@ -92,11 +94,19 @@ class Aggregator:
         self.base_path = ""
         self.fnames = []
         self.flights = []
+        self.isConnected = False
+        self.conn_open = True
 
     def main_window_loop(self):
+        conn_thread = threading.Thread(target=self.pi_connection)
+        conn_thread.start()
+
         while True:
             event, values = self.window.read()
+
             if event == "Exit" or event == sg.WIN_CLOSED:
+                self.conn_open = False
+                conn_thread.join()
                 break
 
             if event == "_FOLDER_":
@@ -335,8 +345,25 @@ class Aggregator:
     def invoke_error(self, msg):
         sg.popup_error(msg)
 
+    def pi_connection(self):
+        with winping.IcmpHandle() as h:
+            while self.conn_open:
+                try:
+                    resp = winping.ping(h, '10.20.30.200')
+                    self.update_connection_status(True)
+                    time.sleep(1)
+                except winping.errors.RequestTimedOut:
+                    self.update_connection_status(False)
+
+    def update_connection_status(self, status):
+        self.isConnected = status
+        if status:
+            self.window["_PI CONNECTION_"].Update("[CONNECTED]", text_color="#00FF00")
+        else:
+            self.window["_PI CONNECTION_"].Update("[NO CONNECTION]", text_color="#FF0000")
+
 
 if __name__ == '__main__':
-    new_window = sg.Window("Hoverfly Data Log Tool", layout, icon="Hoverfly-Tech.ico")
+    new_window = sg.Window("Hoverfly Data Log Tool", layout, icon="Hoverfly-Tech.ico", finalize=True)
     main_window = Aggregator(new_window)
     main_window.main_window_loop()
